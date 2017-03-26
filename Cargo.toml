@@ -1,0 +1,8 @@
+[package]
+authors = ["Walfie <walfington@gmail.com>"]
+name = "streams"
+version = "0.1.0"
+
+[dependencies]
+futures = "0.1.11"
+tokio-core = "0.1.6"
