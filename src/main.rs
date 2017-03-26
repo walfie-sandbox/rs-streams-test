@@ -1,78 +1,55 @@
 extern crate futures;
 extern crate tokio_core;
+extern crate chashmap;
 
+use chashmap::CHashMap;
 use futures::{Future, Stream};
+use futures::sink::Sink;
 use futures::sync::mpsc;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::rc::Rc;
+use std::sync::Arc;
 use tokio_core::reactor::Core;
 
-#[derive(Debug)]
-struct Tweet<'a> {
-    id: u32,
-    name: &'a str,
+#[derive(PartialEq, Hash)]
+struct Consumer {
+    pub addr: u32,
 }
 
-impl<'a> Tweet<'a> {
-    pub fn new(id: u32, name: &'a str) -> Self {
-        Tweet {
-            id: id,
-            name: name,
-        }
+impl Sink for Consumer {
+    type SinkItem = String;
+    type SinkError = ();
+
+    fn start_send(
+        &mut self,
+        item: Self::SinkItem
+    ) -> futures::StartSend<Self::SinkItem, Self::SinkError> {
+        println!("{}", item);
+        Ok(futures::AsyncSink::Ready)
+    }
+    fn poll_complete(&mut self) -> futures::Poll<(), Self::SinkError> {
+        Ok(futures::Async::Ready(()))
     }
 }
 
 fn main() {
-    let mut core = Core::new().unwrap();
+    let subscribers: Arc<CHashMap<u32, Consumer>> = Arc::new(CHashMap::new());
 
     let (tx, rx) = mpsc::unbounded();
 
-    let tweets = vec![Tweet::new(1, "a"),
-                      Tweet::new(2, "a"),
-                      Tweet::new(3, "b"),
-                      Tweet::new(4, "a"),
-                      Tweet::new(5, "a"),
-                      Tweet::new(6, "b"),
-                      Tweet::new(7, "c"),
-                      Tweet::new(8, "a")];
-
-    for t in tweets {
-        tx.send(t);
-    }
-
-    let mut write_streams = HashMap::new();
-    let mut streams_map = Rc::new(RefCell::new(HashMap::new()));
-
-    let x = rx.for_each(|tweet| {
-        match write_streams.entry(tweet.name) {
-            Entry::Vacant(v) => {
-                let (tx2, rx2) = mpsc::unbounded();
-                let zzz = streams_map.clone();
-                zzz.borrow_mut().insert(tweet.name, rx2);
-                tx2.send(tweet);
-                v.insert(tx2);
-            }
-            Entry::Occupied(mut o) => {
-                let mut stream = o.get_mut();
-                stream.send(tweet);
-            }
-        };
+    let publish = rx.for_each(|msg: String| {
+        let subs = subscribers.clone();
+        for (_, subscriber) in subs.into_iter() {
+            subscriber.send(msg.clone());
+        }
 
         Ok(())
     });
 
+    let consumer = Consumer { addr: 1 };
+    subscribers.clone().insert(consumer.addr, consumer);
 
-    let zzz = x.and_then(|_| {
-        let z = streams_map.clone();
-        let mut zz = z.borrow_mut();
-        zz.get_mut("a").unwrap().for_each(|tweet| {
-            println!("{:?}", tweet);
-            Ok(())
-        })
-    });
-
-    core.run(zzz).unwrap();
-
+    tx.send("Hello!".to_string());
 }
