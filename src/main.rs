@@ -1,8 +1,7 @@
 extern crate futures;
 extern crate tokio_core;
-extern crate chashmap;
+extern crate multiqueue;
 
-use chashmap::CHashMap;
 use futures::{Future, Stream};
 use futures::sink::Sink;
 use futures::sync::mpsc;
@@ -14,9 +13,7 @@ use std::sync::Arc;
 use tokio_core::reactor::Core;
 
 #[derive(PartialEq, Hash)]
-struct Consumer {
-    pub addr: u32,
-}
+struct Consumer;
 
 impl Sink for Consumer {
     type SinkItem = String;
@@ -35,21 +32,13 @@ impl Sink for Consumer {
 }
 
 fn main() {
-    let subscribers: Arc<CHashMap<u32, Consumer>> = Arc::new(CHashMap::new());
+    let (tx, rx) = multiqueue::broadcast_fut_queue(25);
 
-    let (tx, rx) = mpsc::unbounded();
+    let consumer = Consumer;
 
-    let publish = rx.for_each(|msg: String| {
-        let subs = subscribers.clone();
-        for (_, subscriber) in subs.into_iter() {
-            subscriber.send(msg.clone());
-        }
+    let f = rx.add_stream().forward(consumer);
 
-        Ok(())
-    });
-
-    let consumer = Consumer { addr: 1 };
-    subscribers.clone().insert(consumer.addr, consumer);
-
-    tx.send("Hello!".to_string());
+    tx.try_send("Hello!".to_string()).unwrap();
+    let mut core = Core::new().unwrap();
+    core.run(f).unwrap();
 }

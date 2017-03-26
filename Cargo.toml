@@ -4,6 +4,7 @@ name = "streams"
 version = "0.1.0"
 
 [dependencies]
-chashmap = "2.1.1"
 futures = "0.1.11"
+multiqueue = "0.3.2"
 tokio-core = "0.1.6"
+tokio-tungstenite = "0.1.0"
