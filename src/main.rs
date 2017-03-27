@@ -39,14 +39,14 @@ impl<Id, Msg> Subscribers<Id, Msg>
         self.0.borrow_mut().remove(id)
     }
 
-    fn broadcast<E: 'static>(&self, msg: Msg) -> Box<Future<Item = (), Error = E>> {
+    fn broadcast(&self, msg: Msg) -> Box<Future<Item = (), Error = ()>> {
         let subscribers = self.0.borrow();
 
         let sends = subscribers.values().map(|subscriber| subscriber.tx.clone().send(msg.clone()));
 
-        let sends_stream = ::futures::stream::futures_unordered(sends).then(|_| Ok(()));
+        let sends_stream = ::futures::stream::futures_unordered(sends);
 
-        Box::new(sends_stream.for_each(|_| Ok(())))
+        Box::new(sends_stream.for_each(|_| Ok(())).map_err(|_| ()))
     }
 }
 
@@ -70,9 +70,13 @@ fn main() {
         handle.spawn(job);
     }
 
-    let broadcast = subscribers.broadcast::<()>("Hello world!".to_string());
+    subscribers.remove(&5);
+
+    let broadcast = subscribers.broadcast("Hello world!".to_string());
 
     let empty = futures::empty::<(), ()>();
 
     core.run(broadcast.then(|_| empty)).expect("failed to run");
+
+    println!("yo");
 }
