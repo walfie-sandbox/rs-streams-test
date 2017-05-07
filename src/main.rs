@@ -4,143 +4,104 @@ extern crate tokio_core;
 use futures::{Future, Stream};
 use futures::sink::Sink;
 use futures::sync::mpsc;
+use std::borrow::ToOwned;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::hash::Hash;
+use std::ops::Deref;
 use std::rc::Rc;
 use std::sync::Arc;
 use tokio_core::reactor::{Core, Handle};
 
-#[derive(Clone, Debug)]
-struct Subscriber<Id, Msg> {
-    pub id: Id,
-    sink: mpsc::UnboundedSender<Rc<Msg>>,
+struct GroupedStream<K, V>
+    where V: 'static
+{
+    pub key: K,
+    stream: mpsc::UnboundedReceiver<V>,
 }
 
-impl<Id, Msg> Subscriber<Id, Msg>
-    where Msg: 'static
-{
-    pub fn new<F>(handle: &Handle, id: Id, on_msg: F) -> Self
-        where F: Fn(&Msg) -> () + 'static
-    {
-        use std::ops::Deref;
-
-        let (tx, rx) = mpsc::unbounded();
-
-        // TODO: What if this subscriber is dropped? does this still run?
-        handle.spawn(rx.for_each(move |msg: Rc<Msg>| {
-            on_msg(msg.deref());
-            Ok(())
-        }));
-
-        Subscriber { id: id, sink: tx }
+impl<K, V> Deref for GroupedStream<K, V> {
+    type Target = mpsc::UnboundedReceiver<V>;
+    fn deref(&self) -> &Self::Target {
+        &self.stream
     }
 }
 
-type SharedHashMap<K, V> = Rc<RefCell<HashMap<K, V>>>;
-
-#[derive(Clone, Debug)]
-struct Subscribers<Id, Msg>(SharedHashMap<Id, Subscriber<Id, Msg>>) where Id: Hash + Eq;
-
-impl<Id, Msg> Subscribers<Id, Msg>
-    where Id: Clone + Eq + Hash,
-          Msg: 'static
+struct GroupBy<K, V>
+    where K: 'static,
+          V: 'static
 {
-    fn new() -> Self {
-        Subscribers(Rc::new(RefCell::new(HashMap::new())))
-    }
+    stream: mpsc::UnboundedReceiver<GroupedStream<K, V>>,
+    writers: Rc<RefCell<HashMap<K, mpsc::UnboundedSender<V>>>>,
+}
 
-    fn insert(&self, subscriber: Subscriber<Id, Msg>) {
-        self.0.borrow_mut().insert(subscriber.id.clone(), subscriber);
-    }
-
-    fn remove(&self, id: &Id) -> Option<Subscriber<Id, Msg>> {
-        self.0.borrow_mut().remove(id)
-    }
-
-    fn broadcast(&self, msg: Msg) -> Box<Future<Item = (), Error = ()>> {
-        let subscribers = self.0.borrow();
-
-        let rc_msg = Rc::new(msg);
-        let sends = subscribers.values()
-            .map(|subscriber| subscriber.sink.clone().send(rc_msg.clone()));
-
-        let sends_stream = ::futures::stream::futures_unordered(sends);
-
-        Box::new(sends_stream.for_each(|_| Ok(())).map_err(|_| ()))
+impl<K, V> Deref for GroupBy<K, V> {
+    type Target = mpsc::UnboundedReceiver<GroupedStream<K, V>>;
+    fn deref(&self) -> &Self::Target {
+        &self.stream
     }
 }
 
-struct StreamPartitioner<K, V, SId>
-    where SId: Clone + Eq + Hash
-{
-    partitions: SharedHashMap<K, Subscribers<SId, V>>,
-}
-
-impl<K, V, SId> StreamPartitioner<K, V, SId>
-    where K: Eq + Hash + 'static,
-          V: 'static,
-          SId: Clone + Eq + Hash + 'static
-{
-    pub fn new<S, F, E>(handle: &Handle, input_stream: S, group_by: F) -> Self
+impl<K, V> GroupBy<K, V> {
+    pub fn new<F, S, E>(handle: &Handle, input_stream: S, key_selector: F) -> Self
         where S: Stream<Item = V, Error = E> + 'static,
               F: Fn(&V) -> K + 'static,
-              E: 'static
+              K: Clone + Hash + Eq
     {
-        let partitions = Rc::new(RefCell::new(HashMap::new()));
+        let writers0: Rc<RefCell<HashMap<K, mpsc::UnboundedSender<V>>>> =
+            Rc::new(RefCell::new(HashMap::new()));
 
-        let partitioner = StreamPartitioner { partitions: partitions.clone() };
+        let (tx, rx) = mpsc::unbounded::<GroupedStream<K, V>>();
 
-        let partitioning = input_stream.map_err(|_| ())
-            .and_then(move |msg| {
-                let mut map = partitions.borrow_mut();
+        let writers = writers0.clone();
 
-                let key = group_by(&msg);
+        let handle0 = handle.clone();
+        let process_input = input_stream
+            .map_err(|_| ())
+            .and_then(move |value| {
+                let key = key_selector(&value);
 
-                match map.entry(key) {
+                match writers.borrow_mut().entry(key) {
                     Entry::Vacant(v) => {
-                        let subs: Subscribers<SId, V> = Subscribers::new();
-                        v.insert(subs);
-                        Box::new(::futures::future::ok(()))
+                        let (grouped_tx, grouped_rx) = mpsc::unbounded();
+                        let grouped_stream = GroupedStream {
+                            key: v.key().clone(),
+                            stream: grouped_rx,
+                        };
+                        let process_new_entry = tx.clone().send(grouped_stream);
+                        v.insert(grouped_tx.clone());
+                        handle.spawn(grouped_tx.send(value).map(|_| ()).map_err(|_| ()));
                     }
-                    Entry::Occupied(o) => o.get().broadcast(msg),
-                }
+                    Entry::Occupied(mut o) => {
+                        handle.spawn(o.get_mut().send(value).map(|_| ()).map_err(|_| ()));
+                    }
+                };
+
+                Ok(())
             })
             .for_each(|_| Ok(()));
 
-        handle.spawn(partitioning);
-        partitioner
-    }
+        handle.spawn(process_input);
 
-    pub fn subscribe(&self, subscriber: Subscriber<SId, V>, key: K) {
-        match self.partitions.borrow_mut().entry(key) {
-            Entry::Vacant(v) => {
-                let subs: Subscribers<SId, V> = Subscribers::new();
-                subs.insert(subscriber);
-                v.insert(subs);
-            }
-            Entry::Occupied(o) => {
-                o.get().insert(subscriber);
-            }
-        }
-    }
-
-    pub fn unsubscribe(&self, subscriber_id: &SId, key: &K) {
-        if let Some(subscribers) = self.partitions.borrow_mut().get(key) {
-            subscribers.remove(subscriber_id);
+        GroupBy {
+            stream: rx,
+            writers: writers0,
         }
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct Tweet {
     user: String,
     text: String,
 }
 
 impl Tweet {
-    pub fn new<S: Into<String>>(user: S, text: S) -> Self {
+    fn new<U, T>(user: U, text: T) -> Self
+        where U: Into<String>,
+              T: Into<String>
+    {
         Tweet {
             user: user.into(),
             text: text.into(),
@@ -152,71 +113,37 @@ fn main() {
     let mut core = Core::new().expect("failed to instantiate Core");
     let handle = core.handle();
 
-    /*
-    let subscribers = Subscribers::new();
+    let (tx, rx) = mpsc::unbounded::<Tweet>();
 
-    for id in 0..10 {
-        let (tx, rx) = mpsc::unbounded();
+    let grouped = GroupBy::new(&handle.clone(), rx, |ref tweet| tweet.user.clone());
 
-        let subscriber = Subscriber { id: id, sink: tx };
+    let group_handle = handle.clone();
+    let task = grouped
+        .stream
+        .for_each(move |group| {
+            let key = group.key;
+            println!("new group: {}", key);
 
-        let job = rx.for_each(move |msg| {
-            println!("{}: {}", id, msg);
+            let task = group
+                .stream
+                .for_each(move |item| {
+                              println!("{}: {:?}", key, item);
+                              Ok(())
+                          });
+
+            group_handle.spawn(task);
             Ok(())
         });
 
-        subscribers.insert(subscriber);
-        handle.spawn(job);
+    handle.spawn(task);
+
+    let tweets =
+        vec![Tweet::new("walf", "hello"), Tweet::new("mil", "nyao"), Tweet::new("walf", "world")];
+
+    for tweet in tweets {
+        tx.clone().send(tweet);
     }
 
-    subscribers.remove(&5);
-
-    let broadcast = subscribers.broadcast(&"Hello world!".to_string());
-
-    let empty = futures::empty::<(), ()>();
-
-    core.run(broadcast.then(|_| empty)).expect("failed to run");
-
-    println!("yo");
-    */
-    let (tx, rx) = mpsc::unbounded();
-
-    let partitioner = StreamPartitioner::new(&handle, rx, |t: &Tweet| t.user.clone());
-
-    let subs = (0..10)
-        .into_iter()
-        .map(|id| {
-            Subscriber::new(&handle, id, move |t| {
-                println!("{}: {:?}", id, t);
-            })
-        })
-        .collect::<Vec<_>>();
-
-    for i in 0..3 {
-        partitioner.subscribe(subs[i].clone(), "a".to_string());
-    }
-
-    for i in 2..7 {
-        partitioner.subscribe(subs[i].clone(), "b".to_string());
-    }
-
-    for i in 6..10 {
-        partitioner.subscribe(subs[i].clone(), "c".to_string());
-    }
-
-    let tweets = [Tweet::new("a", "hello1"),
-                  Tweet::new("b", "hello2"),
-                  Tweet::new("c", "hello3"),
-                  Tweet::new("a", "hello4"),
-                  Tweet::new("b", "hello5"),
-                  Tweet::new("c", "hello6"),
-                  Tweet::new("a", "hello7"),
-                  Tweet::new("b", "hello8"),
-                  Tweet::new("c", "hello9")];
-
-    let sends = for tweet in tweets.into_iter().cloned() {
-        handle.spawn(tx.clone().send(tweet).map(|_| ()).map_err(|_| ()));
-    };
 
     let empty = futures::empty::<(), ()>();
     core.run(empty).unwrap();
