@@ -1,150 +1,73 @@
+#[macro_use]
 extern crate futures;
-extern crate tokio_core;
 
-use futures::{Future, Stream};
-use futures::sink::Sink;
+use futures::{Async, Poll};
+use futures::stream::Stream;
 use futures::sync::mpsc;
-use std::borrow::ToOwned;
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::hash::Hash;
-use std::ops::Deref;
-use std::rc::Rc;
-use std::sync::Arc;
-use tokio_core::reactor::{Core, Handle};
 
-struct GroupedStream<K, V>
-    where V: 'static
-{
-    pub key: K,
-    stream: mpsc::UnboundedReceiver<V>,
+struct GroupedStream<K, V> {
+    key: K,
+    underlying: mpsc::UnboundedReceiver<V>,
 }
 
-impl<K, V> Deref for GroupedStream<K, V> {
-    type Target = mpsc::UnboundedReceiver<V>;
-    fn deref(&self) -> &Self::Target {
-        &self.stream
+impl<K, V> Stream for GroupedStream<K, V> {
+    type Item = V;
+    type Error = ();
+
+    fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
+        self.underlying.poll()
     }
 }
 
-struct GroupBy<K, V>
-    where K: 'static,
-          V: 'static
+struct GroupBy<K, V, S, F> {
+    writers: HashMap<K, mpsc::UnboundedSender<V>>,
+    stream: S,
+    key_selector: F,
+}
+
+impl<K, V, S, F> Stream for GroupBy<K, V, S, F>
+where
+    K: Clone + Eq + Hash,
+    V: Clone,
+    S: Stream<Item = V, Error = ()>,
+    F: Fn(V) -> K,
 {
-    stream: mpsc::UnboundedReceiver<GroupedStream<K, V>>,
-    writers: Rc<RefCell<HashMap<K, mpsc::UnboundedSender<V>>>>,
-}
+    type Item = GroupedStream<K, V>;
+    type Error = ();
 
-impl<K, V> Deref for GroupBy<K, V> {
-    type Target = mpsc::UnboundedReceiver<GroupedStream<K, V>>;
-    fn deref(&self) -> &Self::Target {
-        &self.stream
-    }
-}
+    fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
+        loop {
+            if let Some(value) = try_ready!(self.stream.poll()) {
+                let key = (self.key_selector)(value.clone());
 
-impl<K, V> GroupBy<K, V> {
-    pub fn new<F, S, E>(handle: &Handle, input_stream: S, key_selector: F) -> Self
-        where S: Stream<Item = V, Error = E> + 'static,
-              F: Fn(&V) -> K + 'static,
-              K: Clone + Hash + Eq
-    {
-        let writers0: Rc<RefCell<HashMap<K, mpsc::UnboundedSender<V>>>> =
-            Rc::new(RefCell::new(HashMap::new()));
-
-        let (tx, rx) = mpsc::unbounded::<GroupedStream<K, V>>();
-
-        let writers = writers0.clone();
-
-        let handle0 = handle.clone();
-        let process_input = input_stream
-            .map_err(|_| ())
-            .and_then(move |value| {
-                let key = key_selector(&value);
-
-                match writers.borrow_mut().entry(key) {
-                    Entry::Vacant(v) => {
-                        let (grouped_tx, grouped_rx) = mpsc::unbounded();
-                        let grouped_stream = GroupedStream {
-                            key: v.key().clone(),
-                            stream: grouped_rx,
+                match self.writers.entry(key.clone()) {
+                    Entry::Occupied(mut entry) => {
+                        entry.get_mut().send(value);
+                        return Ok(Async::Ready(None));
+                    }
+                    Entry::Vacant(entry) => {
+                        let (tx, rx) = mpsc::unbounded();
+                        let grouped = GroupedStream {
+                            key: key,
+                            underlying: rx,
                         };
-                        let process_new_entry = tx.clone().send(grouped_stream);
-                        v.insert(grouped_tx.clone());
-                        handle.spawn(grouped_tx.send(value).map(|_| ()).map_err(|_| ()));
+
+                        tx.send(value);
+                        entry.insert(tx);
+                        return Ok(Async::Ready(Some(grouped)));
                     }
-                    Entry::Occupied(mut o) => {
-                        handle.spawn(o.get_mut().send(value).map(|_| ()).map_err(|_| ()));
-                    }
-                };
-
-                Ok(())
-            })
-            .for_each(|_| Ok(()));
-
-        handle.spawn(process_input);
-
-        GroupBy {
-            stream: rx,
-            writers: writers0,
+                }
+            } else {
+                return Ok(Async::Ready(None));
+            }
         }
-    }
-}
 
-#[derive(Debug)]
-struct Tweet {
-    user: String,
-    text: String,
-}
-
-impl Tweet {
-    fn new<U, T>(user: U, text: T) -> Self
-        where U: Into<String>,
-              T: Into<String>
-    {
-        Tweet {
-            user: user.into(),
-            text: text.into(),
-        }
     }
 }
 
 fn main() {
-    let mut core = Core::new().expect("failed to instantiate Core");
-    let handle = core.handle();
-
-    let (tx, rx) = mpsc::unbounded::<Tweet>();
-
-    let grouped = GroupBy::new(&handle.clone(), rx, |ref tweet| tweet.user.clone());
-
-    let group_handle = handle.clone();
-    let task = grouped
-        .stream
-        .for_each(move |group| {
-            let key = group.key;
-            println!("new group: {}", key);
-
-            let task = group
-                .stream
-                .for_each(move |item| {
-                              println!("{}: {:?}", key, item);
-                              Ok(())
-                          });
-
-            group_handle.spawn(task);
-            Ok(())
-        });
-
-    handle.spawn(task);
-
-    let tweets =
-        vec![Tweet::new("walf", "hello"), Tweet::new("mil", "nyao"), Tweet::new("walf", "world")];
-
-    for tweet in tweets {
-        tx.clone().send(tweet);
-    }
-
-
-    let empty = futures::empty::<(), ()>();
-    core.run(empty).unwrap();
+    println!("Hello, world!");
 }
