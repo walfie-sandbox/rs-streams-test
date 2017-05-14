@@ -35,9 +35,8 @@ where
 pub fn new<K, V, S, F>(stream: S, key_selector: F) -> GroupBy<K, V, S, F>
 where
     K: Clone + Eq + Hash,
-    V: Clone,
     S: Stream<Item = V, Error = ()>,
-    F: Fn(V) -> K,
+    F: Fn(&V) -> K,
 {
     GroupBy {
         writers: HashMap::new(),
@@ -49,9 +48,8 @@ where
 impl<K, V, S, F> Stream for GroupBy<K, V, S, F>
 where
     K: Clone + Eq + Hash,
-    V: Clone,
     S: Stream<Item = V, Error = ()>,
-    F: Fn(V) -> K,
+    F: Fn(&V) -> K,
 {
     type Item = GroupedStream<K, V>;
     type Error = ();
@@ -59,7 +57,7 @@ where
     fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
         loop {
             if let Some(value) = try_ready!(self.stream.poll()) {
-                let key = (self.key_selector)(value.clone());
+                let key = (self.key_selector)(&value);
 
                 match self.writers.entry(key.clone()) {
                     Entry::Occupied(entry) => {
