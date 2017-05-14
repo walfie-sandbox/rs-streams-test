@@ -7,6 +7,7 @@ use futures::unsync::mpsc;
 use tokio_core::reactor::Core;
 
 mod group_by;
+mod broadcast;
 
 #[derive(Clone, Debug)]
 struct Message {
