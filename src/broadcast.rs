@@ -5,9 +5,9 @@ use std::collections::HashMap;
 use std::hash::Hash;
 use std::ops::Drop;
 
-fn new<SubId, Sub, Msg, MsgStream, E>(messages: MsgStream)
+pub fn new<SubId, Sub, Msg, MsgStream, E>(messages: MsgStream)
     -> (SubscriptionManager<SubId, Sub, Msg>,
-        Broadcast<SubId, Sub, SelectEvents<SubId, Sub, Msg, MsgStream>>)
+        Broadcast<SubId, Sub, EventStream<SubId, Sub, Msg, MsgStream>>)
 where
     Msg: Clone,
     SubId: Clone + Eq + Hash,
@@ -18,24 +18,35 @@ where
 
     let manager = SubscriptionManager(events_tx);
 
-    let events_stream =
+    let event_stream =
         events_rx.select(messages.map(Event::Message as fn(Msg) -> Event<SubId, Sub, Msg>));
 
     let broadcast = Broadcast {
-        events_stream: events_stream,
+        events_stream: EventStream(event_stream),
         subscribers: HashMap::<SubId, Sub>::new(),
     };
 
     (manager, broadcast)
 }
 
-type SelectEvents<SubId, Sub, Msg, MsgStream> = Select<mpsc::UnboundedReceiver<Event<SubId,
-                                                                                     Sub,
-                                                                                     Msg>>,
-                                                       Map<MsgStream,
-                                                           fn(Msg) -> Event<SubId, Sub, Msg>>>;
 
-struct SubscriptionManager<SubId, Sub, Msg>(mpsc::UnboundedSender<Event<SubId, Sub, Msg>>);
+pub struct EventStream<SubId, Sub, Msg, MsgStream>(
+    Select<mpsc::UnboundedReceiver<Event<SubId, Sub, Msg>>,
+            Map<MsgStream, fn(Msg) -> Event<SubId, Sub, Msg>>>
+);
+
+impl<SubId, Sub, Msg, MsgStream> Stream for EventStream<SubId, Sub, Msg, MsgStream>
+where MsgStream: Stream<Item = Msg, Error = ()>
+{
+    type Item = Event<SubId, Sub, Msg>;
+    type Error = ();
+
+    fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
+        self.0.poll()
+    }
+}
+
+pub struct SubscriptionManager<SubId, Sub, Msg>(mpsc::UnboundedSender<Event<SubId, Sub, Msg>>);
 
 impl<SubId, Sub, Msg> SubscriptionManager<SubId, Sub, Msg>
 where
@@ -67,7 +78,7 @@ where
     }
 }
 
-struct Subscription<SubId, Sub, Msg>
+pub struct Subscription<SubId, Sub, Msg>
 where
     SubId: Clone,
 {
@@ -95,13 +106,13 @@ where
     }
 }
 
-enum Event<SubId, Sub, Msg> {
+pub enum Event<SubId, Sub, Msg> {
     Subscribe { id: SubId, subscriber: Sub },
     Unsubscribe(SubId),
     Message(Msg),
 }
 
-struct Broadcast<SubId, Sub, EventsStream> {
+pub struct Broadcast<SubId, Sub, EventsStream> {
     events_stream: EventsStream,
     subscribers: HashMap<SubId, Sub>,
 }
