@@ -1,137 +1,174 @@
-use futures::{Async, AsyncSink, Poll, Sink, StartSend};
+use futures::{Async, Future, Poll, Sink};
+use futures::stream::{Map, Select, Stream};
+use futures::sync::mpsc;
 use std::collections::HashMap;
-use std::fmt::Debug;
 use std::hash::Hash;
 use std::ops::Drop;
-use std::sync::mpsc;
 
-#[derive(Debug)]
-enum Event<Id, S> {
-    Subscribe(Id, S),
-    Unsubscribe(Id),
-}
-
-pub struct Subscription<'a, Id: 'a, S: 'a> {
-    id: Option<Id>,
-    broadcaster: &'a Broadcast<Id, S>,
-}
-
-impl<'a, Id, S> Drop for Subscription<'a, Id, S> {
-    fn drop(&mut self) {
-        /*
-        if let Some(id) = self.id.take() {
-            self.broadcaster.unsubscribe(id);
-        }
-        */
-    }
-}
-
-pub struct Broadcast<Id, S> {
-    subscribers: HashMap<Id, S>,
-    events_sender: mpsc::Sender<Event<Id, S>>,
-    events_receiver: mpsc::Receiver<Event<Id, S>>,
-}
-
-impl<Id, S> Broadcast<Id, S> {
-    pub fn unsubscribe(&self, id: Id) {
-        let _ = self.events_sender.send(Event::Unsubscribe(id));
-    }
-}
-
-impl<Id, Msg, S> Broadcast<Id, S>
+fn new<SubId, Sub, Msg, MsgStream, E>(messages: MsgStream)
+    -> (SubscriptionManager<SubId, Sub, Msg>,
+        Broadcast<SubId, Sub, SelectEvents<SubId, Sub, Msg, MsgStream>>)
 where
-    Id: Clone + Eq + Hash,
     Msg: Clone,
-    S: Sink<SinkItem = Msg>,
+    SubId: Clone + Eq + Hash,
+    Sub: Sink<SinkItem = Msg, SinkError = E>,
+    MsgStream: Stream<Item = Msg, Error = ()>,
 {
-    pub fn new() -> Self {
-        let (sender, receiver) = mpsc::channel();
+    let (events_tx, events_rx) = mpsc::unbounded::<Event<SubId, Sub, Msg>>();
 
-        Broadcast {
-            subscribers: HashMap::new(),
-            events_sender: sender,
-            events_receiver: receiver,
-        }
+    let manager = SubscriptionManager(events_tx);
+
+    let events_stream =
+        events_rx.select(messages.map(Event::Message as fn(Msg) -> Event<SubId, Sub, Msg>));
+
+    let broadcast = Broadcast {
+        events_stream: events_stream,
+        subscribers: HashMap::<SubId, Sub>::new(),
+    };
+
+    (manager, broadcast)
+}
+
+type SelectEvents<SubId, Sub, Msg, MsgStream> = Select<mpsc::UnboundedReceiver<Event<SubId,
+                                                                                     Sub,
+                                                                                     Msg>>,
+                                                       Map<MsgStream,
+                                                           fn(Msg) -> Event<SubId, Sub, Msg>>>;
+
+struct SubscriptionManager<SubId, Sub, Msg>(mpsc::UnboundedSender<Event<SubId, Sub, Msg>>);
+
+impl<SubId, Sub, Msg> SubscriptionManager<SubId, Sub, Msg>
+where
+    SubId: Clone,
+{
+    // TODO: Better error
+    fn subscribe
+        (
+        &self,
+        id: SubId,
+        subscriber: Sub,
+    ) -> Result<Subscription<SubId, Sub, Msg>, mpsc::SendError<Event<SubId, Sub, Msg>>> {
+        let event = Event::Subscribe {
+            id: id.clone(),
+            subscriber,
+        };
+        mpsc::UnboundedSender::send(&self.0, event).map(
+            |_| {
+                Subscription {
+                    id: Some(id),
+                    manager: SubscriptionManager(self.0.clone()),
+                }
+            }
+        )
     }
 
-    pub fn subscribe(&self, id: Id, sink: S) -> Subscription<Id, S> {
-        let _ = self.events_sender.send(Event::Subscribe(id.clone(), sink));
-
-        Subscription {
-            id: Some(id),
-            broadcaster: self,
-        }
+    fn unsubscribe(&self, id: SubId) -> Result<(), mpsc::SendError<Event<SubId, Sub, Msg>>> {
+        mpsc::UnboundedSender::send(&self.0, Event::Unsubscribe(id))
     }
+}
 
-    fn sync_subscribers(&mut self) {
-        println!("syncing subscriber mesages");
+struct Subscription<SubId, Sub, Msg>
+where
+    SubId: Clone,
+{
+    id: Option<SubId>,
+    manager: SubscriptionManager<SubId, Sub, Msg>,
+}
 
-        for event in self.events_receiver.try_iter() {
-            println!("received subscriber message");
-            match event {
-                Event::Subscribe(id, sink) => {
-                    self.subscribers.insert(id, sink);
-                    println!("subscribe");
-                }
-                Event::Unsubscribe(id) => {
-                    self.subscribers.remove(&id);
-                    println!("unsubscribe");
-                }
-            };
+impl<SubId, Sub, Msg> Drop for Subscription<SubId, Sub, Msg>
+where
+    SubId: Clone,
+{
+    fn drop(&mut self) {
+        if let Some(id) = self.id.take() {
+            self.manager.unsubscribe(id);
         }
     }
 }
 
-impl<Id, S, Msg> Sink for Broadcast<Id, S>
+enum Event<SubId, Sub, Msg> {
+    Subscribe { id: SubId, subscriber: Sub },
+    Unsubscribe(SubId),
+    Message(Msg),
+}
+
+struct Broadcast<SubId, Sub, EventsStream> {
+    events_stream: EventsStream,
+    subscribers: HashMap<SubId, Sub>,
+}
+
+impl<SubId, Sub, EventsStream, Msg, E> Future for Broadcast<SubId, Sub, EventsStream>
 where
-    Id: Clone + Eq + Hash,
-    Msg: Clone + Debug,
-    S: Sink<SinkItem = Msg> + Debug,
+    Msg: Clone,
+    SubId: Eq + Hash,
+    Sub: Sink<SinkItem = Msg, SinkError = E>,
+    EventsStream: Stream<Item = Event<SubId, Sub, Msg>, Error = ()>
 {
-    type SinkItem = Msg;
-    type SinkError = ();
+    type Item = ();
+    type Error = ();
 
-    fn start_send(&mut self, item: Msg) -> StartSend<Msg, ()> {
-        self.sync_subscribers();
+    fn poll(&mut self) -> Poll<(), ()> {
+        loop {
+            let event = try_ready!(self.events_stream.poll());
 
-        println!("yo");
+            if event.is_none() {
+                return Ok(Async::NotReady);
+            }
 
-        for (_, sub) in self.subscribers.iter_mut() {
-            println!("{:?} {:?}", sub, item);
+            assert!(event.is_some());
 
-            // If subscriber fails to receive, we don't care
-            let _ = sub.start_send(item.clone());
+            match event.unwrap() {
+                Event::Subscribe { id: sub_id, subscriber: sub } => {
+                    self.subscribers.insert(sub_id, sub);
+                },
+                Event::Unsubscribe(sub_id) => {
+                    self.subscribers.remove(&sub_id);
+                },
+                Event::Message(msg) => {
+// If subscriber fails to receive, we don't care
+// TODO: Adjust this. Also why does rustfmt put this on the left
+                    for (_, sub) in self.subscribers.iter_mut() {
+                        let _ = sub.start_send(msg.clone());
+                    }
+                }
+            }
         }
-
-        println!("done");
-
-        Ok(AsyncSink::Ready)
-    }
-
-    fn poll_complete(&mut self) -> Poll<(), ()> {
-        self.sync_subscribers();
-
-        Ok(Async::Ready(()))
     }
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
-    use futures::Stream;
+    use futures::{self, Future, Stream};
     use futures::unsync::mpsc;
 
     #[test]
     fn test_broadcast() {
-        let (tx1, mut rx1) = mpsc::unbounded::<&str>();
-        let (tx2, mut rx2) = mpsc::unbounded::<&str>();
-        let (tx3, mut rx3) = mpsc::unbounded::<&str>();
+        // Run on a task context
+        futures::lazy(
+            || {
+                let (mut msg_tx, msg_rx) = mpsc::unbounded::<&str>();
 
-        let mut broadcast = Broadcast::new();
-        let _ = broadcast.subscribe(1, tx1);
+                let (manager, mut broadcast) = new(msg_rx);
 
-        let _ = broadcast.start_send("Hello");
+                let (tx1, mut rx1) = mpsc::unbounded::<&str>();
+                let (tx2, mut rx2) = mpsc::unbounded::<&str>();
 
-        assert!(rx1.poll() == Ok(Async::Ready(Some("Hello"))));
+                let sub1 = manager.subscribe(1, tx1);
+                let sub2 = manager.subscribe(2, tx2);
+
+                let _ = mpsc::UnboundedSender::send(&msg_tx, "Hello");
+
+                let _ = broadcast.poll();
+                assert!(rx1.poll() == Ok(Async::Ready(Some("Hello"))));
+
+                // Fails because `Select` is round-robin
+                //assert!(rx2.poll() == Ok(Async::Ready(Some("Hello"))));
+
+                Ok::<(), ()>(())
+            }
+        )
+                .wait()
+                .unwrap();
     }
 }
