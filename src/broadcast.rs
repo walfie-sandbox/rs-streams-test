@@ -75,14 +75,23 @@ where
     manager: SubscriptionManager<SubId, Sub, Msg>,
 }
 
+impl<SubId, Sub, Msg> Subscription<SubId, Sub, Msg>
+where
+    SubId: Clone,
+{
+    fn unsubscribe(&mut self) {
+        if let Some(id) = self.id.take() {
+            let _ = self.manager.unsubscribe(id);
+        }
+    }
+}
+
 impl<SubId, Sub, Msg> Drop for Subscription<SubId, Sub, Msg>
 where
     SubId: Clone,
 {
     fn drop(&mut self) {
-        if let Some(id) = self.id.take() {
-            self.manager.unsubscribe(id);
-        }
+        self.unsubscribe();
     }
 }
 
@@ -147,23 +156,50 @@ mod test {
         // Run on a task context
         futures::lazy(
             || {
-                let (mut msg_tx, msg_rx) = mpsc::unbounded::<&str>();
-
+                let (msg_tx, msg_rx) = mpsc::unbounded::<&str>();
                 let (manager, mut broadcast) = new(msg_rx);
+
+                let mut tick = move || { let _ = broadcast.poll(); };
+                let send = move |msg| { let _ = mpsc::UnboundedSender::send(&msg_tx, msg); };
 
                 let (tx1, mut rx1) = mpsc::unbounded::<&str>();
                 let (tx2, mut rx2) = mpsc::unbounded::<&str>();
 
                 let sub1 = manager.subscribe(1, tx1);
+                tick();
+
+                send("1");
+                tick();
+
+                assert_eq!(rx1.poll(), Ok(Async::Ready(Some("1"))));
+                assert_eq!(rx2.poll(), Ok(Async::NotReady));
+
                 let sub2 = manager.subscribe(2, tx2);
+                tick();
 
-                let _ = mpsc::UnboundedSender::send(&msg_tx, "Hello");
+                send("2");
+                tick();
 
-                let _ = broadcast.poll();
-                assert!(rx1.poll() == Ok(Async::Ready(Some("Hello"))));
+                assert_eq!(rx1.poll(), Ok(Async::Ready(Some("2"))));
+                assert_eq!(rx2.poll(), Ok(Async::Ready(Some("2"))));
 
-                // Fails because `Select` is round-robin
-                //assert!(rx2.poll() == Ok(Async::Ready(Some("Hello"))));
+                sub1.unwrap().unsubscribe();
+                tick();
+
+                send("3");
+                tick();
+
+                assert_eq!(rx1.poll(), Ok(Async::Ready(None)));
+                assert_eq!(rx2.poll(), Ok(Async::Ready(Some("3"))));
+
+                sub2.unwrap().unsubscribe();
+                tick();
+
+                send("4");
+                tick();
+
+                assert_eq!(rx1.poll(), Ok(Async::Ready(None)));
+                assert_eq!(rx2.poll(), Ok(Async::Ready(None)));
 
                 Ok::<(), ()>(())
             }
