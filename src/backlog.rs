@@ -1,11 +1,11 @@
-use std::mem;
+use std::cell::RefCell;
 use std::sync::Arc;
 
 struct Backlog<T> {
     buffer: Vec<T>,
     revision: u32,
     next_index: usize,
-    snapshot: BacklogSnapshot<T>,
+    snapshot: RefCell<BacklogSnapshot<T>>,
 }
 
 #[derive(Clone)]
@@ -20,10 +20,12 @@ impl<T: Clone> Backlog<T> {
             buffer: Vec::with_capacity(capacity),
             revision: 0,
             next_index: 0,
-            snapshot: BacklogSnapshot {
-                buffer: Arc::new(Vec::with_capacity(0)),
-                revision: 0,
-            },
+            snapshot: RefCell::new(
+                BacklogSnapshot {
+                    buffer: Arc::new(Vec::with_capacity(0)),
+                    revision: 0,
+                }
+            ),
         }
     }
 
@@ -31,15 +33,17 @@ impl<T: Clone> Backlog<T> {
         if self.buffer.len() < self.buffer.capacity() {
             self.buffer.push(item);
         } else {
-            self.buffer.insert(self.next_index, item);
+            self.buffer[self.next_index] = item;
         }
         self.next_index = (self.next_index + 1) % self.buffer.capacity();
-        self.revision.wrapping_add(1);
+        self.revision = self.revision.wrapping_add(1);
     }
 
-    fn snapshot(&mut self) -> Arc<Vec<T>> {
-        if self.snapshot.revision == self.revision {
-            self.snapshot.buffer.clone()
+    fn snapshot(&self) -> Arc<Vec<T>> {
+        let mut latest = self.snapshot.borrow_mut();
+
+        if latest.revision == self.revision {
+            latest.buffer.clone()
         } else {
             let (left, right) = self.buffer.split_at(self.next_index);
 
@@ -48,10 +52,40 @@ impl<T: Clone> Backlog<T> {
             items.extend(right.into_iter().cloned());
             items.extend(left.into_iter().cloned());
 
-            self.snapshot.buffer = Arc::new(items);
-            self.snapshot.revision = self.revision;
+            latest.revision = self.revision;
+            latest.buffer = Arc::new(items);
 
-            self.snapshot.buffer.clone()
+            latest.buffer.clone()
         }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn maintain_initial_capacity() {
+        let mut backlog = Backlog::with_capacity(2);
+
+        backlog.insert(1);
+        assert_eq!(*backlog.snapshot(), vec![1]);
+
+        backlog.insert(2);
+        assert_eq!(*backlog.snapshot(), vec![1, 2]);
+
+        backlog.insert(3);
+        assert_eq!(*backlog.snapshot(), vec![2, 3]);
+    }
+
+    #[test]
+    fn multiple_overflows() {
+        let mut backlog = Backlog::with_capacity(5);
+
+        for i in 0..100 {
+            backlog.insert(i);
+        }
+
+        assert_eq!(*backlog.snapshot(), (95..100).collect::<Vec<_>>());
     }
 }
