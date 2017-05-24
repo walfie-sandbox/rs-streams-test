@@ -8,6 +8,7 @@ use tokio_core::reactor::Core;
 
 mod group_by;
 mod broadcast;
+mod backlog;
 
 #[derive(Clone, Debug)]
 struct Message {

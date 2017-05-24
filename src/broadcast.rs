@@ -129,28 +129,29 @@ where
 
     fn poll(&mut self) -> Poll<(), ()> {
         loop {
-            let event = try_ready!(self.events_stream.poll());
+            if let Some(event) = try_ready!(self.events_stream.poll()) {
+                match event {
+                    Event::Subscribe { id: sub_id, subscriber: sub } => {
+                        println!("Subscribe");
+                        self.subscribers.insert(sub_id, sub);
+                    },
+                    Event::Unsubscribe(sub_id) => {
+                        println!("Unsubscribe");
+                        self.subscribers.remove(&sub_id);
+                    },
+                    Event::Message(msg) => {
+                        println!("Message");
 
-            if event.is_none() {
-                return Ok(Async::NotReady);
-            }
-
-            assert!(event.is_some());
-
-            match event.unwrap() {
-                Event::Subscribe { id: sub_id, subscriber: sub } => {
-                    self.subscribers.insert(sub_id, sub);
-                },
-                Event::Unsubscribe(sub_id) => {
-                    self.subscribers.remove(&sub_id);
-                },
-                Event::Message(msg) => {
 // If subscriber fails to receive, we don't care
 // TODO: Adjust this. Also why does rustfmt put this on the left
-                    for (_, sub) in self.subscribers.iter_mut() {
-                        let _ = sub.start_send(msg.clone());
+                        for (_, sub) in self.subscribers.iter_mut() {
+                            println!("Sending Message");
+                            let _ = sub.start_send(msg.clone());
+                        }
                     }
                 }
+            } else {
+                return Ok(Async::Ready(()));
             }
         }
     }
@@ -211,6 +212,43 @@ mod test {
 
                 assert_eq!(rx1.poll(), Ok(Async::Ready(None)));
                 assert_eq!(rx2.poll(), Ok(Async::Ready(None)));
+
+                Ok::<(), ()>(())
+            }
+        )
+                .wait()
+                .unwrap();
+    }
+
+    #[test]
+    fn unsubscribe_when_out_of_scope() {
+        futures::lazy(
+            || {
+                let (msg_tx, msg_rx) = mpsc::unbounded::<&str>();
+                let (manager, mut broadcast) = new(msg_rx);
+
+                let mut tick = move || { let _ = broadcast.poll(); };
+                let send = move |msg| { let _ = mpsc::UnboundedSender::send(&msg_tx, msg); };
+
+                let (tx, mut rx) = mpsc::unbounded::<&str>();
+
+                {
+                    // TODO: If tx is cloned here, Async::NotReady is returned
+                    let sub = manager.subscribe(1, tx);
+                    tick();
+
+                    send("1");
+                    tick();
+
+                    assert_eq!(rx.poll(), Ok(Async::Ready(Some("1"))));
+                }
+                tick();
+
+                send("2");
+                tick();
+
+                // This returns Async::NotReady if tx is cloned above
+                assert_eq!(rx.poll(), Ok(Async::Ready(None)));
 
                 Ok::<(), ()>(())
             }
